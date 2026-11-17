@@ -6,6 +6,13 @@ on:
     paths:
       - '**'
       - '!.github/**'
+      - '.github/workflows/pages.yml'
+      - '.github/scripts/verify-published*.mjs'
+  pull_request:
+    branches: [gh-pages]
+    paths:
+      - '.github/workflows/pages.yml'
+      - '.github/scripts/verify-published*.mjs'
 
 permissions: {}
 
@@ -14,16 +21,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      PAGES_ARTIFACT: github-pages-${{ github.run_attempt }}
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact_id }}
+      artifact-name: ${{ env.PAGES_ARTIFACT }}
     steps:
       - name: Check out published files
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -34,13 +41,57 @@ jobs:
         run: node --test .github/scripts/verify-published.test.mjs
 
       - name: Upload site artifact
+        if: github.event_name == 'push'
+        id: upload
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
+          name: ${{ env.PAGES_ARTIFACT }}
           path: .
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out revision and verification script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            build-revision.txt
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Wait for artifact visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.package.outputs.artifact-id }}
+        run: |
+          for attempt in {1..8}; do
+            if gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq '.artifacts[] | select(.expired == false) | .id' | grep -Fxq "$ARTIFACT_ID"; then
+              echo "Pages artifact $ARTIFACT_ID is visible after attempt $attempt"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Pages artifact $ARTIFACT_ID is still absent from the workflow run after 40 seconds"
+          exit 1
 
       - name: Publish site
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        with:
+          artifact_name: ${{ needs.package.outputs.artifact-name }}
 
       - name: Verify published revision
         env:
